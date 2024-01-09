@@ -37,9 +37,11 @@ pkg_check_modules(DEPS REQUIRED afb-binding>=4 libsystemd>=222 json-c)
 
 pkg_get_variable(VSCRIPT afb-binding version_script)
 
+set(DEFBUS SYSTEM CACHE STRING "default bus, either SYSTEM or USER")
 set(AFM_APP_DIR ${CMAKE_INSTALL_PREFIX}/redpesk CACHE PATH "Application directory")
 
-add_library(dbus-binding MODULE dbus-binding.c)
+add_library(dbus-binding MODULE dbus-binding.c dbus-jsonc.c)
+target_compile_definitions(dbus-binding PRIVATE DEFAULT_BUSNAME=BUSNAME_${DEFBUS} VERSION="${PROJECT_VERSION}")
 target_compile_options(dbus-binding PRIVATE ${DEPS_CFLAGS})
 target_include_directories(dbus-binding PRIVATE ${DEPS_INCLUDE_DIRS})
 target_link_libraries(dbus-binding ${DEPS_LDFLAGS})
