@@ -125,6 +125,7 @@ static struct watch *watchers = NULL;
 static struct evrec *evts = NULL;
 
 /*****************************************************************************************/
+/* helpers */
 /*****************************************************************************************/
 
 /*
@@ -148,6 +149,7 @@ static struct json_object *jsonc_of_dbus_error(const sd_bus_error *err)
 	return obj;
 }
 
+/* generic unlink of an item of a list pnxt (with next on first position) */
 static void unlinklistitem(void *item, void *pnxt)
 {
 	void *nxt = *(void**)pnxt;
@@ -157,6 +159,7 @@ static void unlinklistitem(void *item, void *pnxt)
 		*(void**)pnxt = *(void**)item;
 }
 
+/* unlink and free the item from the list pnxt */
 static void removelistitem(void *item, void *pnxt)
 {
 	unlinklistitem(item, pnxt);
@@ -164,6 +167,7 @@ static void removelistitem(void *item, void *pnxt)
 }
 
 /*****************************************************************************************/
+/* bus provider */
 /*****************************************************************************************/
 
 /* returns the standard bus name or NULL is busname is illegal */
@@ -185,22 +189,29 @@ static struct sd_bus *getbus(const char *busname)
 	struct sd_bus *result = NULL;
 	int rc, index = 2;
 	for (;;) {
+		/* check if end */
 		if (!index)
 			break;
+		/* check if found */
 		if (strcmp(busname, names[--index]))
 			continue;
+		/* check if available */
 		result = buses[index];
 		if (result != NULL)
 			break;
+		/* create */
 		rc = (index ? sd_bus_default_system : sd_bus_default_user)(&result);
 		if (rc >= 0) {
+			/* attach to the main loop */
 			rc = sd_bus_attach_event(result, sdevlp, SD_EVENT_PRIORITY_NORMAL);
 			if (rc >= 0) {
+				/* record result */
 				buses[index] = result;
 				break;
 			}
 			sd_bus_unref(result);
 		}
+		/* error found */
 		AFB_ERROR("creation of SDBUS %s failed", names[index]);
 		result = NULL;
 		break;
@@ -209,8 +220,91 @@ static struct sd_bus *getbus(const char *busname)
 }
 
 /*****************************************************************************************/
+/* DBUS thread and and its job control */
 /*****************************************************************************************/
 
+/* submit a request that will be processed by  the given proc in the DBUS thread context */
+static void submit(afb_req_t req, void (*proc)(afb_req_t))
+{
+	pthread_mutex_lock(&mutex);
+	if (sdevlp == NULL) {
+		pthread_mutex_unlock(&mutex);
+		afb_req_reply(req, AFB_ERRNO_INTERNAL_ERROR, 0, NULL);
+		AFB_ERROR("No event loop");
+	}
+	else if (njob == MXNRJOB) {
+		/* ooooch! too many jobs !!! */
+		pthread_mutex_unlock(&mutex);
+		afb_req_reply(req, AFB_ERRNO_INTERNAL_ERROR, 0, NULL);
+		AFB_ERROR("Too many requests");
+	}
+	else {
+		/* first, shift the pending job queue */
+		uint64_t inc = 1;
+		int jdx, idx = njob++;
+		while (idx) {
+			jdx = idx - 1;
+			reqs[idx] = reqs[jdx];
+			procs[idx] = procs[jdx];
+			idx = jdx;
+		}
+		/* add the given job */
+		reqs[0] = afb_req_addref(req);
+		procs[0] = proc;
+		pthread_mutex_unlock(&mutex);
+		/* signal the DBUS thread that a new job is queued */
+		write(efd, & inc, sizeof inc);
+	}
+}
+
+/* DBUS thread simply runs the sd_event loop forever */
+static int gotjob(sd_event_source *s, int fd, uint32_t revents, void *userdata)
+{
+	uint64_t count;
+	afb_req_t req;
+	void (*proc)(afb_req_t);
+
+	read(efd, &count, sizeof count);
+	for (;;) {
+		pthread_mutex_lock(&mutex);
+		if (njob == 0) {
+			pthread_mutex_unlock(&mutex);
+			return 0;
+		}
+		req = reqs[--njob];
+		proc = procs[njob];
+		pthread_mutex_unlock(&mutex);
+		proc(req);
+		afb_req_unref(req);
+	}
+}
+
+/* DBUS thread simply runs the sd_event loop forever */
+static void *run(void *argh)
+{
+	pthread_mutex_lock(&mutex);
+	/* create the event loop */
+	int rc = sd_event_default(&sdevlp);
+	if (rc >= 0) {
+		/* attach the loop signaler */
+		rc = sd_event_add_io(sdevlp, NULL, efd, EPOLLIN, gotjob, NULL);
+		if (rc >= 0) {
+			pthread_mutex_unlock(&mutex);
+			sd_event_loop(sdevlp);
+			pthread_mutex_lock(&mutex);
+		}
+		sd_event_unref(sdevlp);
+		sdevlp = NULL;
+	}
+	pthread_mutex_unlock(&mutex);
+	return NULL;
+}
+
+/*****************************************************************************************/
+/* manage afb event records (evrec) */
+/*****************************************************************************************/
+
+/* search in the list */
 static struct evrec *search_evrec(const char *name)
 {
 	struct evrec *evrec = evts;
@@ -219,6 +313,7 @@ static struct evrec *search_evrec(const char *name)
 	return evrec;
 }
 
+/* create and add in the list */
 static struct evrec *create_evrec(afb_api_t api, const char *name)
 {
 	struct evrec *evrec = malloc(sizeof *evrec + 1 + strlen(name));
@@ -238,24 +333,28 @@ static struct evrec *create_evrec(afb_api_t api, const char *name)
 	return evrec;
 }
 
+/* remove from the list */
 static void remove_evrec(struct evrec *evrec)
 {
 	removelistitem(evrec, &evts);
 }
 
 /*****************************************************************************************/
+/* manage dbus matchers (watch) */
 /*****************************************************************************************/
 
+/* search in the list */
 static struct watch *search_watch(struct evsigspec *evs)
 {
 	struct watch *watch;
 	for (watch = watchers ; watch != NULL ; watch = watch->next) {
-		if (!strcmp(evs->busname, watch->busname) && strcmp(evs->match, watch->match))
+		if (!strcmp(evs->busname, watch->busname) && !strcmp(evs->match, watch->match))
 			break;
 	}
 	return watch;
 }
 
+/* create and add in the list */
 static struct watch *create_watch(struct evsigspec *evs)
 {
 	struct watch *watch;
@@ -274,14 +373,17 @@ static struct watch *create_watch(struct evsigspec *evs)
 	return watch;
 }
 
+/* remove from the list */
 static void remove_watch(struct watch *watch)
 {
 	removelistitem(watch, &watchers);
 }
 
 /*****************************************************************************************/
+/* manage items linking matches (watch) to events */
 /*****************************************************************************************/
 
+/* search in the list */
 static struct evlist *search_evlist(struct watch *watch, struct evrec *evrec)
 {
 	struct evlist *evlist = watch->evlist;
@@ -290,6 +392,7 @@ static struct evlist *search_evlist(struct watch *watch, struct evrec *evrec)
 	return evlist;
 }
 
+/* create and add in the list */
 static struct evlist *create_evlist(struct watch *watch, struct evrec *evrec)
 {
 	struct evlist *evlist = malloc(sizeof *evlist);
@@ -302,14 +405,17 @@ static struct evlist *create_evlist(struct watch *watch, struct evrec *evrec)
 	return evlist;
 }
 
+/* remove from the list */
 static void remove_evlist(struct watch *watch, struct evlist *evlist)
 {
 	removelistitem(evlist, &watch->evlist);
 }
 
 /*****************************************************************************************/
+/* manage subscriptions */
 /*****************************************************************************************/
 
+/* propagate the received DBUS signal to afb listeners */
 static int on_signal(sd_bus_message *msg, void *userdata, sd_bus_error *ret_error)
 {
 	struct watch *watch = userdata;
@@ -319,12 +425,14 @@ static int on_signal(sd_bus_message *msg, void *userdata, sd_bus_error *ret_erro
 	int rc = -1;
 	const sd_bus_error *err;
 
+	/* check if error */
 	err = sd_bus_message_get_error(msg);
 	if (err != NULL)
 		data = jsonc_of_dbus_error(err);
 	else
 		rc = msg2jsonc(msg, &data);
 
+	/* make the sent event */
 	obj = json_object_new_object();
 	json_object_object_add(obj, "bus", json_object_new_string(watch->busname));
 	json_object_object_add(obj, "status", json_object_new_string(rc >= 0 ? "success" : "error"));
@@ -334,6 +442,7 @@ static int on_signal(sd_bus_message *msg, void *userdata, sd_bus_error *ret_erro
 	json_object_object_add(obj, "interface", json_object_new_string(sd_bus_message_get_interface(msg)));
 	json_object_object_add(obj, "member",    json_object_new_string(sd_bus_message_get_member(msg)));
 
+	/* send the event now */
 	afb_create_data_raw(&adat, AFB_PREDEFINED_TYPE_JSON_C, obj, 0, (void*)json_object_put, obj);
 	evlist = watch->evlist;
 	while (evlist != NULL) {
@@ -345,7 +454,7 @@ static int on_signal(sd_bus_message *msg, void *userdata, sd_bus_error *ret_erro
 	return 1;
 }
 
-/* in DBUS thread processing of the request  */
+/* process subscribe and unsubscribe requests */
 static void process_sub(afb_req_t req, int dir)
 {
 	afb_data_t first_arg;
@@ -461,9 +570,10 @@ static void process_unsubscribe(afb_req_t req)
 }
 
 /*****************************************************************************************/
+/* manage signals */
 /*****************************************************************************************/
 
-/* in DBUS thread processing of the request  */
+/* process signal requests */
 static void process_signal(afb_req_t req)
 {
 	afb_data_t first_arg;
@@ -543,6 +653,7 @@ cleanup:
 }
 
 /*****************************************************************************************/
+/* manage calls */
 /*****************************************************************************************/
 
 /*
@@ -557,6 +668,7 @@ static int on_call_reply(sd_bus_message *msg, void *userdata, sd_bus_error *ret_
 	int sts = AFB_ERRNO_GENERIC_FAILURE;
 	const sd_bus_error *err;
 
+	/* make the reply */
 	err = sd_bus_message_get_error(msg);
 	if (err != NULL)
 		obj = jsonc_of_dbus_error(err);
@@ -568,13 +680,14 @@ static int on_call_reply(sd_bus_message *msg, void *userdata, sd_bus_error *ret_
 			sts = 0;
 	}
 
+	/* send the reply now */
 	afb_create_data_raw(&data, AFB_PREDEFINED_TYPE_JSON_C, obj, 0, (void*)json_object_put, obj);
 	afb_req_reply(req, sts, 1, &data);
 	afb_req_unref(req);
 	return 1;
 }
 
-/* in DBUS thread processing of the request  */
+/* process signal requests */
 static void process_call(afb_req_t req)
 {
 	afb_data_t first_arg;
@@ -648,80 +761,9 @@ cleanup:
 }
 
 /*****************************************************************************************/
+/* verbs */
 /*****************************************************************************************/
 
-/* submit a request that will be processed by  the given proc in the DBUS thread context */
-static void submit(afb_req_t req, void (*proc)(afb_req_t))
-{
-	pthread_mutex_lock(&mutex);
-	if (sdevlp == NULL) {
-		pthread_mutex_unlock(&mutex);
-		afb_req_reply(req, AFB_ERRNO_INTERNAL_ERROR, 0, NULL);
-		AFB_ERROR("No event loop");
-	}
-	else if (njob == MXNRJOB) {
-		/* ooooch! too many jobs !!! */
-		pthread_mutex_unlock(&mutex);
-		afb_req_reply(req, AFB_ERRNO_INTERNAL_ERROR, 0, NULL);
-		AFB_ERROR("Too many requests");
-	}
-	else {
-		/* first, shift the pending job queue */
-		uint64_t inc = 1;
-		int jdx, idx = njob++;
-		while (idx) {
-			jdx = idx - 1;
-			reqs[idx] = reqs[jdx];
-			procs[idx] = procs[jdx];
-			idx = jdx;
-		}
-		/* add the given job */
-		reqs[0] = afb_req_addref(req);
-		procs[0] = proc;
-		pthread_mutex_unlock(&mutex);
-		/* signal the DBUS thread that a new job is queued */
-		write(efd, & inc, sizeof inc);
-	}
-}
-
-/* DBUS thread simply runs the sd_event loop forever */
-static int gotjob(sd_event_source *s, int fd, uint32_t revents, void *userdata)
-{
-	uint64_t count;
-	afb_req_t req;
-	void (*proc)(afb_req_t);
-
-	read(efd, &count, sizeof count);
-	for (;;) {
-		pthread_mutex_lock(&mutex);
-		if (njob == 0) {
-			pthread_mutex_unlock(&mutex);
-			return 0;
-		}
-		req = reqs[--njob];
-		proc = procs[njob];
-		pthread_mutex_unlock(&mutex);
-		proc(req);
-		afb_req_unref(req);
-	}
-}
-
-/*****************************************************************************************/
-/*****************************************************************************************/
-
-/*
- * Make a raw call to DBUS method
- * The query should have:
- *   {
- *     "bus": "optional: 'system' or 'user' (default)"
- *     "destination": "destination handling the object",
- *     "path": "object path",
- *     "interface": "interface of the call",
- *     "member": "member of the interface of the call",
- *     "signature": "signature of the arguments",
- *     "arguments": "ARRAY of arguments"
- *   }
- */
 static void v_call(afb_req_t req, unsigned narg, const afb_data_t args[])
 {
 	submit(req, process_call);
@@ -749,31 +791,22 @@ static void v_version(afb_req_t req, unsigned narg, const afb_data_t args[])
 	afb_req_reply(req, 0, 1, &data);
 }
 
+/* array of the verbs exported to afb-daemon */
+static const afb_verb_t verbs[] = {
+  { .verb="version",     .callback=v_version,     .info="get cuurent version" },
+  { .verb="call",        .callback=v_call,        .info="call to dbus method" },
+  { .verb="signal",      .callback=v_signal,      .info="signal to dbus method" },
+  { .verb="subscribe",   .callback=v_subscribe,   .info="subscribe to a dbus signal" },
+  { .verb="unsubscribe", .callback=v_unsubscribe, .info="unsubscribe to a dbus signal" },
+  { .verb=NULL }
+};
+
 /*****************************************************************************************/
+/* initialisation and declaration */
 /*****************************************************************************************/
 
-/* DBUS thread simply runs the sd_event loop forever */
-static void *run(void *argh)
-{
-	pthread_mutex_lock(&mutex);
-	/* create the event loop */
-	int rc = sd_event_default(&sdevlp);
-	if (rc >= 0) {
-		/* attach the loop signaler */
-		rc = sd_event_add_io(sdevlp, NULL, efd, EPOLLIN, gotjob, NULL);
-		if (rc >= 0) {
-			pthread_mutex_unlock(&mutex);
-			sd_event_loop(sdevlp);
-			pthread_mutex_lock(&mutex);
-		}
-		sd_event_unref(sdevlp);
-		sdevlp = NULL;
-	}
-	pthread_mutex_unlock(&mutex);
-	return NULL;
-}
-
-static int create_global_event(afb_api_t api)
+/* instanciate the default event */
+static int create_default_event(afb_api_t api)
 {
 	struct evrec *evrec = create_evrec(api, DEFAULT_EVENT_NAME);
 	if (evrec == NULL)
@@ -789,8 +822,8 @@ static int mainctl(afb_api_t api, afb_ctlid_t ctlid, afb_ctlarg_t ctlarg, void *
 	pthread_t thread;
 	switch (ctlid) {
 	case afb_ctlid_Pre_Init:
-		/* create the global event */
-		rc = create_global_event(api);
+		/* create the default event */
+		rc = create_default_event(api);
 		/* create the loop signaler */
 		if (rc >= 0)
 			rc = efd = eventfd(0, 0);
@@ -804,27 +837,12 @@ static int mainctl(afb_api_t api, afb_ctlid_t ctlid, afb_ctlarg_t ctlarg, void *
 	return rc;
 }
 
-/*
- * array of the verbs exported to afb-daemon
- */
-static const afb_verb_t verbs[] = {
-  /* VERB'S NAME           SESSION MANAGEMENT          FUNCTION TO CALL        SHORT DESCRIPTION */
-  { .verb= "version",     .session= AFB_SESSION_NONE, .callback=v_version,    .info="get cuurent version" },
-  { .verb= "call",        .session= AFB_SESSION_NONE, .callback=v_call,       .info="call to dbus method" },
-  { .verb= "signal",      .session= AFB_SESSION_NONE, .callback=v_signal,     .info="signal to dbus method" },
-  { .verb= "subscribe",   .session= AFB_SESSION_NONE, .callback=v_subscribe,  .info="subscribe to a dbus signal" },
-  { .verb= "unsubscribe", .session= AFB_SESSION_NONE, .callback=v_unsubscribe, .info="unsubscribe to a dbus signal" },
-  { .verb= NULL } /* marker for end of the array */
-};
-
-/*
- * description of the binding for afb-daemon
- */
+/* declaration of the binding for afb-binder */
 const afb_binding_t afbBindingExport =
 {
-    .api   = "dbus",		/* the API name (or binding name or prefix) */
-    .info  = "raw dbus binding",	/* short description of of the binding */
+    .api   = "dbus",
+    .info  = "dbus binding",
     .mainctl = mainctl,
-    .verbs = verbs	/* the array describing the verbs of the API */
+    .verbs = verbs
 };
 
