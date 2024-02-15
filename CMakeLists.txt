@@ -52,4 +52,6 @@ set_target_properties(dbus-binding PROPERTIES PREFIX "" LINK_FLAGS "-Wl,--versio
 set(DEST ${AFM_APP_DIR}/dbus-binding)
 install(TARGETS dbus-binding
         LIBRARY DESTINATION ${DEST}/lib)
+install(FILES rpconfig/manifest.yml
+        DESTINATION ${DEST}/.rpconfig)
 
