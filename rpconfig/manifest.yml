@@ -3,7 +3,7 @@ id: dbus-binding
 version: 1.0
 name: dbus-binding
 description: Provides a API for dbus
-author: IoT.bzh team <team@iot.bzh>
+Author: IoT.bzh team <team@iot.bzh>
 license: MIT
 targets:
   - target: main
