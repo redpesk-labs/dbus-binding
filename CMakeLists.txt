@@ -24,7 +24,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(dbus-binding
-        VERSION 0.0
+        VERSION 1.0.0
         DESCRIPTION "Connection to DBus binding"
         HOMEPAGE_URL "https://github.com/redpesk-samples/dbus-binding"
         LANGUAGES C)
